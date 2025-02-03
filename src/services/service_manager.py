@@ -1,4 +1,4 @@
-from knowledge_base_service import KnowledgeBaseService
+from .knowledge_base_service import KnowledgeBaseService
 
 class ServiceManager:
     _instance = None

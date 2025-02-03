@@ -11,8 +11,8 @@ from multiprocessing import Pool
 from loguru import logger
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from bs4 import BeautifulSoup
-from markdown_text_splitter import MarkdownParser
-from tools import get_partial_sha256_hash
+from .markdown_text_splitter import MarkdownParser
+from .tools import get_partial_sha256_hash
 
 
 class DocumentName:

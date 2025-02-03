@@ -7,14 +7,14 @@ from loguru import logger
 from typing import List, Optional, Any
 from pymilvus import connections, utility, Collection
 from pymilvus.exceptions import MilvusException
-from ..utils.document_processor import  DocumentProcessor, FeatureDataBase
-from ..store.milvus import Milvus
-from ..store.elastic_search import ElasticSearch
-from ..clients.emdeddings.client import EmbedderClient
-from ..clients.reranker.client import RerankerClient
-from ..clients.pdf.client import PdfClient
-from ..models.models import SearchMode, SearchResult
-from ..utils.tools import handle_status_file
+from utils.document_processor import DocumentProcessor, FeatureDataBase
+from utils.tools import handle_status_file
+from store.milvus import Milvus
+from store.elastic_search import ElasticSearch
+from clients.emdeddings.client import EmbedderClient
+from clients.reranker.client import RerankerClient
+from clients.pdf.client import PdfClient
+from models.models import SearchMode, SearchResult
 
 
 class KnowledgeBaseService:

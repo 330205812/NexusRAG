@@ -5,9 +5,9 @@ from loguru import logger
 from typing import List, Optional
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 
-from ...services.service_manager import ServiceManager
-from ...utils.tools import handle_status_file, sanitize_filename
-from ...models.models import (
+from services.service_manager import ServiceManager
+from utils.tools import handle_status_file, sanitize_filename
+from models.models import (
     CreateKnowledgeBaseRequest, CreateKnowledgeBaseResponse,
     AddFileRequest, AddFileResponse,
     SearchRequest, SearchResponse, SearchResult,
