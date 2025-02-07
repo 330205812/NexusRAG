@@ -1,15 +1,42 @@
-# NexusRAG
-NexusRAG is an enterprise-level knowledge base backend system designed for LLM implementation. The system provides ready-to-use modules for document processing and RAG, enabling rapid deployment of large-scale knowledge retrieval systems through integrated full-text search, semantic retrieval, and knowledge graph querying capabilities. The system allows users to:
+# 🚀 NexusRAG
+NexusRAG is a comprehensive knowledge base backend system designed for the implementation of Large Language Models (LLMs). 
+It provides ready-to-use modules for document processing and Retrieval-Augmented Generation (RAG), enabling rapid deployment of large-scale knowledge retrieval systems to your Generative AI (GenAI) applications. 
+These applications can include enterprise virtual employees, educational tools, or personalized assistants.
+
+The system allows users to: 
 - Create and manage personal knowledge bases
 - Automatically upload and process documents in personal knowledge bases (supports multimodal OCR)
-- Employ multiple search methods across knowledge bases (full-text, vector, or hybrid search)
+- Employ multiple search methods across knowledge bases (full-text search, semantic retrieval, and knowledge graph querying, or hybrid search)
 - Perform fine-grained management of document segments within knowledge bases
 - Track document processing status in real-time
 
-## Quick start
+## Components
 
-### 1. Prepare Environment and 下载对应模型文件
+Below are the components you can use:
 
+| Type        |                                                                                          What Supported                                                                                          |          Where          |
+|:------------|:------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------:|:-----------------------:|
+| Embedding   |                                                       [`Sentence-transformers`](https://huggingface.co/GanymedeNil/text2vec-large-chinese)                                                       | /src/clients/embeddings |
+| Rerank      |                                                      - [`BCE`](https://huggingface.co/maidalun1020/bce-reranker-base_v1)<br>- BGE Reranker                                                       |  /src/clients/reranker  |
+| File Parser |                                                                        [`MinerU`](https://github.com/opendatalab/MinerU)                                                                         |     💡Pending merge     |
+| Store       |                                                                     [`milvus`](https://github.com/milvus-io/milvus) (Docker)                                                                     |                         |
+|             |                                                              [`elasticsearch`](https://github.com/elastic/elasticsearch)   (Docker)                                                              |                         |
+|             |                                                                         [`neo4j`](https://neo4j.com/)           (Docker)                                                                         |     💡Pending merge     |
+| Chunking    |                                                                                       MarkdownTextSplitter                                                                                       |        Built-in         |
+|             |                                                                                  RecursiveCharacterTextSplitter                                                                                  |        Built-in         |
+- **This project can integrate with external embedding and reranker APIs. Note that these external APIs must conform to the OpenAI API format standards.**
+- **"Pending merge" means "Under final code review"**
+- **Always welcome to contribute more components.**
+
+
+
+## 📌 Quick start
+
+### 1. Prepare Environment and Download Corresponding Model Files
+```bash
+apt update
+apt install python-dev libxml2-dev libxslt1-dev antiword unrtf poppler-utils pstotext tesseract-ocr flac ffmpeg lame libmad0 libsox-fmt-mp3 sox libjpeg-dev swig libpulse-dev
+```
 Create volume directories under the `docker` directory：
 ```bash
 cd docker
@@ -73,10 +100,23 @@ es_url = http://localhost:9200
 index_name = test
 milvus_url = localhost:19530
 ```
-
-
-
-
+### 3. Launch Service
+```
+cd src
+```
+Launch Embedding Service
+```bash
+python ./clients/emdeddings/server.py --config_path ../config.ini --gpu_id 0
+```
+Launch Reranker Service
+```bash
+python ./clients/reranker/server.py --config_path ../config.ini --gpu_id 0
+```
+Launch Knowledge Base Service
+```bash
+python main.py --config_path ../config.ini --gpu_id 0
+```
+## 🔍 API endpoints introduction
 
 
 
