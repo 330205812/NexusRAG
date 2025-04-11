@@ -3,13 +3,20 @@ import argparse
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from loguru import logger
 from langchain.docstore.document import Document
+from tools import calc_time
+from tqdm.auto import tqdm
 
 
 def _default_text_mapping() -> Dict:
-    return {'properties': {'text': {'type': 'text'}}}
+    return {
+        'properties': {
+            'text': {'type': 'text'},
+            'updated_at': {'type': 'keyword'}
+        }
+    }
 
 
-class ElasticSearch():
+class ElasticKeywordsSearch():
 
     def __init__(
             self,
@@ -59,12 +66,14 @@ class ElasticSearch():
         logger.debug(f"ElasticKeywordsSearch initialized with URL: {elasticsearch_url} and index: {index_name}")
 
     def add_meta_info_in_kb(self, kb_id) -> None:
+        current_time = calc_time()
         kb_info = {
             "dataset_id": kb_id,
             "type": "kb_info",
             "content": "",
             "collection_id": "",
-            "embedding_id": ""
+            "embedding_id": "",
+            "updated_at": current_time
         }
         try:
             self.client.update(
@@ -79,9 +88,10 @@ class ElasticSearch():
     def add_texts(
             self,
             knowledge_base_id: str,
-            texts: Iterable[str],
-            file_id_list: Iterable[str],
-            chunks_ids_list: Iterable[str],
+            texts: List[str],
+            file_id_list: List[str],
+            chunks_ids_list: List[str],
+            file_name_list: List[str],
             refresh_indices: bool = True,
             **kwargs: Any,
     ) -> Tuple[List[str], List[str]]:
@@ -91,42 +101,89 @@ class ElasticSearch():
         except ImportError:
             raise ImportError('Could not import elasticsearch python package. '
                               'Please install it with `pip install elasticsearch`.')
+
         requests = []
         ids = []
+        current_time = calc_time()
 
-        for text, file_id, chunk_id in zip(texts, file_id_list, chunks_ids_list):
+        estimated_size = 0
+        MAX_BATCH_SIZE = 100 * 1024 * 1024  # 50MB
+        current_batch = []
+        all_failures = []
+
+        pbar = tqdm(zip(texts, file_id_list, chunks_ids_list, file_name_list), total=len(texts))
+        for text, file_id, chunk_id, file_name in pbar:
+            pbar.set_description(f"Adding chunks to ES [{file_name}|{file_id}]")
+
             request = {
                 '_op_type': 'update',
                 '_index': self.index_name,
                 '_id': f"{knowledge_base_id}_{file_id}_{chunk_id}",
-                'doc':
-                    {
-                        'dataset_id': knowledge_base_id,
-                        'content': text,
-                        'collection_id': file_id,
-                        'embedding_id': chunk_id
-                    },
+                'doc': {
+                    'dataset_id': knowledge_base_id,
+                    'content': text,
+                    'collection_id': file_id,
+                    'embedding_id': chunk_id,
+                    'file_name': file_name,
+                    'updated_at': current_time
+                },
                 'doc_as_upsert': True
             }
-            requests.append(request)
+
+            current_size = len(str(request).encode('utf-8'))
+            estimated_size += current_size
+
+            current_batch.append(request)
             ids.append(f"{knowledge_base_id}_{file_id}_{chunk_id}")
 
-        try:
-            success, errors = bulk(self.client, requests, stats_only=False)
+            if estimated_size >= MAX_BATCH_SIZE:
+                try:
+                    success, errors = bulk(
+                        self.client,
+                        current_batch,
+                        stats_only=False,
+                        chunk_size=1000,
+                        request_timeout=120,
+                        raise_on_error=False,
+                        max_retries=3,
+                        initial_backoff=2,
+                        max_backoff=600
+                    )
+                    if errors:
+                        all_failures.extend(errors)
+                except Exception as e:
+                    logger.error(f"Batch bulk operation failed: {str(e)}")
+                    all_failures.extend([{"update": {"_id": req['_id']}} for req in current_batch])
 
-            if not errors:
-                failed_files = []
-            else:
-                failed_ids = {error['update']['_id'] for error in errors}
-                failed_files = list(
-                    {unique_id.split('_')[1] for unique_id in failed_ids})
+                current_batch = []
+                estimated_size = 0
 
-        except Exception as e:
-            logger.error(f"Bulk operation failed completely: {str(e)}")
-            raise
+        if current_batch:
+            try:
+                success, errors = bulk(
+                    self.client,
+                    current_batch,
+                    stats_only=False,
+                    chunk_size=500,
+                    request_timeout=60,
+                    raise_on_error=False
+                )
+                if errors:
+                    all_failures.extend(errors)
+            except Exception as e:
+                logger.error(f"Final batch bulk operation failed: {str(e)}")
+                all_failures.extend([{"update": {"_id": req['_id']}} for req in current_batch])
+
+        if not all_failures:
+            failed_files = []
+        else:
+            failed_files = {error['update']['doc']['collection_id'] for error in all_failures}
 
         if refresh_indices:
-            self.client.indices.refresh(index=self.index_name)
+            try:
+                self.client.indices.refresh(index=self.index_name)
+            except Exception as e:
+                logger.error(f"Refresh index failed: {str(e)}")
 
         return ids, failed_files
 
@@ -145,12 +202,13 @@ class ElasticSearch():
             if not self.client.exists(index=self.index_name, id=id):
                 logger.error(f"Not found chunk with id in elasticsearch: {id}")
                 return f"Not found chunk with id in elasticsearch: {id}"
-
+            current_time = calc_time()
             update_body = {
                 "doc": {
                     "dataset_id": knowledge_base_id,
                     "collection_id": file_id,
-                    "embedding_id": chunk_id
+                    "embedding_id": chunk_id,
+                    "updated_at": current_time
                 }
             }
 
@@ -238,12 +296,13 @@ class ElasticSearch():
 
         keyword_queries = []
         for key in keywords:
-            keyword_queries.append({query_strategy: {'text': key}})
+            keyword_queries.append({query_strategy: {'content': key}})
 
         if keyword_queries:
             match_query['bool'][must_or_should] = keyword_queries
+            if must_or_should == 'should':
+                match_query['bool']['minimum_should_match'] = 1
 
-        logger.info(f'Searching in knowledge base: {knowledge_base_id}')
         response = self.client_search(
             self.client,
             self.index_name,
@@ -260,7 +319,8 @@ class ElasticSearch():
                     'knowledge_base_id': hit['_source']['dataset_id'],
                     'file_id': hit['_source']['collection_id'],
                     'chunk_id': hit['_source']['embedding_id'],
-                    'relevance_score': hit['_score']
+                    'relevance_score': hit['_score'],
+                    'file_name': hit['_source']['file_name']
                 }
             )
             docs_and_scores.append(doc)
@@ -441,6 +501,7 @@ class ElasticSearch():
             page_size: Optional[int] = None,
             page_num: Optional[int] = None,
             use_embedding_id_as_id: Optional[bool] = True,
+            key: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         List chunks information for the specified knowledge base and file, with pagination support
@@ -491,11 +552,20 @@ class ElasticSearch():
             query = {
                 "bool": {
                     "must": [
-                        {"term": {"dataset_id": knowledge_base_id}},
-                        {"term": {"collection_id": file_id}}
+                        {"term": {"dataset_id": knowledge_base_id}}
                     ]
                 }
             }
+
+            if file_id:
+                query["bool"]["must"].append({"term": {"collection_id": file_id}})
+
+            if key:
+                query["bool"]["must"].append({
+                    "match_phrase": {
+                        "content": key
+                    }
+                })
 
             if page_size is not None and page_num is not None:
                 if page_size <= 0 or page_num <= 0:
@@ -506,7 +576,8 @@ class ElasticSearch():
                     index=self.index_name,
                     query=query,
                     from_=from_index,
-                    size=page_size
+                    size=page_size,
+                    sort=[{"_score": "desc"}] if key else None
                 )
 
                 total_hits = response['hits']['total']['value']
@@ -527,7 +598,8 @@ class ElasticSearch():
                 index=self.index_name,
                 query=query,
                 scroll=scroll_time,
-                size=scroll_size
+                size=scroll_size,
+                sort=[{"_score": "desc"}] if key else None
             )
 
             scroll_id = response['_scroll_id']
@@ -538,6 +610,7 @@ class ElasticSearch():
             for hit in hits:
                 chunk_info = {
                     'id': hit['_source']['embedding_id'] if use_embedding_id_as_id else hit['_id'],
+                    'score': hit['_score'] if key else None,
                     **hit['_source']
                 }
                 chunks.append(chunk_info)
@@ -554,6 +627,7 @@ class ElasticSearch():
                 for hit in hits:
                     chunk_info = {
                         'id': hit['_source']['embedding_id'] if use_embedding_id_as_id else hit['_id'],
+                        'score': hit['_score'] if key else None,
                         **hit['_source']
                     }
                     chunks.append(chunk_info)
@@ -622,6 +696,6 @@ def parse_args():
 if __name__ == '__main__':
     args = parse_args()
 
-    elastic_search = ElasticSearch(
+    elastic_search = ElasticKeywordsSearch(
         elasticsearch_url=args.elasticsearch_url,
         index_name=args.index_name)

@@ -1,8 +1,12 @@
 from __future__ import annotations
-import numpy as np
+import threading
 from loguru import logger
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Dict
 from uuid import uuid4
+import numpy as np
+from tqdm.asyncio import tqdm
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 
@@ -29,7 +33,6 @@ class Milvus():
     def __init__(
             self,
             embedding_server=None,
-            embedding_url: str = None,
             dim: int = None,
             collection_name: str = "LangChainCollection",
             collection_description: str = "",
@@ -40,6 +43,7 @@ class Milvus():
             search_params: Optional[dict] = None,
             drop_old: Optional[bool] = False,
             auto_id: bool = False,
+            if_search: bool = False,
             *,
             primary_field: str = "id",
             text_field: str = "text",
@@ -49,6 +53,8 @@ class Milvus():
             partition_names: Optional[list] = None,
             replica_number: int = 1,
             timeout: Optional[float] = None,
+            max_workers: int = 4,
+            chunk_size: int = 1000
     ):
         """
             Initialize the Milvus vector store.
@@ -80,6 +86,14 @@ class Milvus():
             "GPU_IVF_FLAT": {"metric_type": "L2", "params": {"nprobe": 10}},
             "GPU_IVF_PQ": {"metric_type": "L2", "params": {"nprobe": 10}},
         }
+        # logger.debug(f"Milvus initializing with embedding_server: {embedding_server}")
+        self.max_workers = max_workers
+        self.chunk_size = chunk_size
+        self.thread_pool = ThreadPoolExecutor(max_workers=max_workers)
+        self._local = threading.local()
+        self.semaphore = asyncio.Semaphore(max_workers)
+
+        self._connection_lock = asyncio.Lock()
         self.embedding_func = None
         self.dim = None
         if embedding_server:
@@ -111,7 +125,9 @@ class Milvus():
         # Create the connection to the server
         if connection_args is None:
             connection_args = DEFAULT_MILVUS_CONNECTION
-        self.alias, address = self._create_connection_alias(connection_args)
+        self.connection_args = connection_args
+        # self.alias = uuid4().hex
+        self.alias, address = self._create_connection_alias(self.connection_args)
         self.col: Optional[Collection] = None
 
         # Grab the existing collection if it exists
@@ -123,6 +139,10 @@ class Milvus():
             if self.collection_properties is not None:
                 self.col.set_properties(self.collection_properties)
             self.is_new_collection = False
+        elif if_search:
+            logger.warning(f"Search mode is True, but collection '{collection_name}' does not exist")
+            raise ValueError(f"Collection '{collection_name}' does not exist")
+
         # If need to drop old, drop it
         if drop_old and isinstance(self.col, Collection):
             self.col.drop()
@@ -136,17 +156,18 @@ class Milvus():
         )
         if self.dim:
             logger.debug(
-                f"Milvus initialized with URL:{address} and collection: {self.collection_name}, embedding dimension: {self.dim}")
+                f"Milvus initialized with alias: {self.alias} and collection: {self.collection_name}, embedding dimension: {self.dim}")
         else:
-            logger.debug(f"Milvus initialized with URL:{address} and collection: {self.collection_name}")
+            logger.debug(f"Milvus initialized with alias: {self.alias}, collection: {self.collection_name}")
 
-    def __del__(self):
+    async def close(self):
 
-        try:
-            if hasattr(self, 'alias'):
-                connections.disconnect(alias=self.alias)
-        except:
-            pass
+        if hasattr(self._local, 'connection_alias'):
+            try:
+                connections.disconnect(alias=self._local.connection_alias)
+                delattr(self._local, 'connection_alias')
+            except Exception as e:
+                logger.error(f"Error closing connection: {e}")
 
     def _init(
             self,
@@ -170,12 +191,13 @@ class Milvus():
 
         schema = CollectionSchema(
             fields=[
-                FieldSchema(name=self._primary_field, dtype=DataType.VARCHAR, max_length=100, is_primary=True),
+                FieldSchema(name=self._primary_field, dtype=DataType.VARCHAR, max_length=200, is_primary=True),
                 FieldSchema(name=self._text_field, dtype=DataType.VARCHAR, max_length=65535),
                 FieldSchema(name=self._vector_field, dtype=DataType.FLOAT_VECTOR, dim=self.dim),
-                FieldSchema(name="knowledge_base_id", dtype=DataType.VARCHAR, max_length=100),
-                FieldSchema(name="file_id", dtype=DataType.VARCHAR, max_length=100),
-                FieldSchema(name="chunk_id", dtype=DataType.VARCHAR, max_length=100),
+                FieldSchema(name="knowledge_base_id", dtype=DataType.VARCHAR, max_length=200),
+                FieldSchema(name="file_id", dtype=DataType.VARCHAR, max_length=200),
+                FieldSchema(name="chunk_id", dtype=DataType.VARCHAR, max_length=200),
+                FieldSchema(name="file_name", dtype=DataType.VARCHAR, max_length=256),
             ],
             description="Collection for storing text and its embeddings"
         )
@@ -191,44 +213,15 @@ class Milvus():
     def embeddings(self) -> Embeddings:
         return self.embedding_func
 
-    def _create_connection_alias(self, connection_args: dict) -> str:
-        """Create the connection to the Milvus server."""
+    def _create_connection_alias(self, connection_args: dict) -> tuple[str, str]:
+        """Create a new unique connection to the Milvus server."""
 
-        # Grab the connection arguments that are used for checking existing connection
         address: str = connection_args.get("address", None)
-        user = connection_args.get("user", None)
 
-        if address is not None:
-            given_address = address
-        else:
-            given_address = None
-            logger.debug("Missing standard address type for reuse attempt")
+        alias = f"milvus_{uuid4().hex}"
 
-        # User defaults to empty string when getting connection info
-        if user is not None:
-            tmp_user = user
-        else:
-            tmp_user = ""
-
-        # If a valid address was given, then check if a connection exists
-        if given_address is not None:
-            for con in connections.list_connections():
-                addr = connections.get_connection_addr(con[0])
-                if (
-                        con[1]
-                        and ("address" in addr)
-                        and (addr["address"] == given_address)
-                        and ("user" in addr)
-                        and (addr["user"] == tmp_user)
-                ):
-                    logger.debug(f"Using previous connection: {con[0]}")
-                    return con[0], given_address
-
-        # Generate a new connection if one doesn't exist
-        alias = uuid4().hex
         try:
             connections.connect(alias=alias, **connection_args)
-            logger.debug(f"Created new connection using: {alias}")
             return alias, address
         except MilvusException as e:
             logger.error(f"Failed to create new connection using: {alias}")
@@ -325,46 +318,74 @@ class Milvus():
                 timeout=timeout,
             )
 
-    def add_texts(
+    async def ensure_connection(self):
+        if hasattr(self, 'alias') and connections.has_connection(alias=self.alias):
+            return self.col
+
+        if hasattr(self, 'connection_args'):
+            self.alias, _ = self._create_connection_alias(self.connection_args)
+
+            self.col = Collection(
+                self.collection_name,
+                using=self.alias,
+            )
+
+            if utility.load_state(self.collection_name, using=self.alias) != "Loaded":
+                self.col.load(
+                    partition_names=self.partition_names,
+                    replica_number=self.replica_number,
+                    timeout=self.timeout
+                )
+            return self.col
+        else:
+            raise ValueError("No connection arguments available")
+
+    async def process_chunk(
             self,
             knowledge_base_id: str,
             vector_model_name: str,
             texts: List[str],
             file_ids: List[str],
             chunk_ids: List[str],
+            file_name_list: List[str],
             **kwargs: Any,
     ) -> List[str]:
         """
-        upsert
+        upsert single chunk
         """
         try:
-            # embeddings = self.embedding_func.embed_documents(texts)
-            embeddings = []
+            entities = []
+            await self.ensure_connection()
 
-            res = self.embedding_func.v1_embeddings(
+            if self.embedding_func is None:
+                logger.error("embedding_func is None before v1_embeddings call")
+                raise ValueError("Embedding function is None")
+
+            res = await self.embedding_func.v1_embeddings(
                 model=vector_model_name,
                 input=texts
             )
 
-            if res:
-                data = res.get("data", [])
-                if data:
-                    for i, embedding_item in enumerate(data):
-                        embedding = embedding_item.get("embedding", [])
-                        embeddings.append(embedding)
-
-            entities = []
-            for text, embedding, file_id, chunk_id in zip(texts, embeddings, file_ids, chunk_ids):
-                pk_id = f"{knowledge_base_id}_{file_id}_{chunk_id}"
-                entity = {
-                    "id": pk_id,
-                    "vector": embedding,
-                    "knowledge_base_id": knowledge_base_id,
-                    "file_id": file_id,
-                    "chunk_id": chunk_id,
-                    "text": text
-                }
-                entities.append(entity)
+            if res and res.get("data", []):
+                for text, embedding_item, file_id, chunk_id, file_name in zip(
+                        texts,
+                        res["data"],
+                        file_ids,
+                        chunk_ids,
+                        file_name_list
+                ):
+                    embedding = embedding_item.get("embedding", [])
+                    pk_id = f"{knowledge_base_id}_{file_id}_{chunk_id}"
+                    entity = {
+                        "id": pk_id,
+                        "vector": embedding,
+                        "knowledge_base_id": knowledge_base_id,
+                        "file_id": file_id,
+                        "chunk_id": chunk_id,
+                        "file_name": file_name,
+                        "text": text
+                    }
+                    entities.append(entity)
 
             result = self.col.upsert(
                 entities,
@@ -372,17 +393,75 @@ class Milvus():
                 timeout=kwargs.get('timeout')
             )
 
-            all_ids = [entity["id"] for entity in entities]
             success_ids = result.primary_keys
-
-            return success_ids, all_ids
+            return success_ids
 
         except Exception as e:
             logger.error(f"Upsert documents failed: {str(e)}")
-            all_ids = [entity["id"] for entity in entities]
-            return [], all_ids
+            logger.error(f"embedding_func state: {self.embedding_func}")
+            return []
 
-    def update_chunk(
+    async def add_texts(
+            self,
+            knowledge_base_id: str,
+            vector_model_name: str,
+            texts: List[str],
+            file_ids: List[str],
+            chunk_ids: List[str],
+            file_name_list: List[str],
+            **kwargs: Any
+    ) -> List[str]:
+        """
+        Concurrent Batch Text Insertion
+        """
+
+        if not texts:
+            return []
+
+        total_texts = len(texts)
+        success_ids = []
+
+        chunks = []
+        for i in range(0, total_texts, self.chunk_size):
+            end_idx = min(i + self.chunk_size, total_texts)
+            chunks.append((
+                texts[i:end_idx],
+                file_ids[i:end_idx],
+                chunk_ids[i:end_idx],
+                file_name_list[i:end_idx]
+            ))
+
+        try:
+
+            pbar = tqdm(chunks)
+            for i, (chunk_texts, chunk_file_ids, chunk_chunk_ids, chunk_file_name_list) in enumerate(pbar):
+                pbar.set_description(f"Adding chunks to Milvus [{chunk_file_name_list[0]}|{chunk_file_ids[0]}]")
+
+                chunk_ids = await self.process_chunk(
+                    knowledge_base_id=knowledge_base_id,
+                    vector_model_name=vector_model_name,
+                    texts=chunk_texts,
+                    file_ids=chunk_file_ids,
+                    chunk_ids=chunk_chunk_ids,
+                    file_name_list=chunk_file_name_list,
+                    **kwargs
+                )
+                success_ids.extend(chunk_ids)
+
+                if i > 0 and i % 5 == 0:
+                    logger.info(
+                        f"Processed {i}/{len(chunks)} batches, pausing for 1 second to allow system buffering...")
+                    await asyncio.sleep(1)
+
+            return success_ids
+        except Exception as e:
+            logger.error(f"Batch insertion failed: {str(e)}")
+            return success_ids
+        finally:
+            if self.embedding_func:
+                await self.embedding_func.close()
+
+    async def update_chunk(
             self,
             knowledge_base_id: str,
             file_id: str,
@@ -397,7 +476,7 @@ class Milvus():
             expr = f'id == "{id}"'
             results = self.col.query(
                 expr=expr,
-                output_fields=["id", "vector", "knowledge_base_id", "file_id", "chunk_id", "text"],
+                output_fields=["id", "vector", "knowledge_base_id", "file_id", "chunk_id", "text", "file_name"],
                 timeout=kwargs.get('timeout')
             )
 
@@ -405,22 +484,28 @@ class Milvus():
                 logger.error(f"Not found chunk with id in milvus: {id}")
                 return f"Not found chunk with id in milvus: {id}"
 
+            original_file_name = results[0].get('file_name') if results else None
+
             entity = {
                 "id": id,
                 "knowledge_base_id": knowledge_base_id,
                 "file_id": file_id,
-                "chunk_id": chunk_id
+                "chunk_id": chunk_id,
+                "file_name": original_file_name
             }
+            try:
+                res = await self.embedding_func.v1_embeddings(
+                    model=vector_model_name,
+                    input=[text]
+                )
 
-            res = self.embedding_func.v1_embeddings(
-                model=vector_model_name,
-                input=[text]
-            )
-
-            if res and res.get("data"):
-                embedding = res["data"][0].get("embedding", [])
-                entity["vector"] = embedding
-                entity["text"] = text
+                if res and res.get("data"):
+                    embedding = res["data"][0].get("embedding", [])
+                    entity["vector"] = embedding
+                    entity["text"] = text
+            finally:
+                if hasattr(self.embedding_func, 'close'):
+                    await self.embedding_func.close()
 
             result = self.col.upsert(
                 [entity],
@@ -457,19 +542,22 @@ class Milvus():
             Returns:
                 List[Tuple[Document, float]]: List of tuples containing Document objects and similarity scores
         """
+        try:
+            file_conditions = [f'file_id == "{file_id}"' for file_id in file_ids]
+            expr = f'knowledge_base_id == "{knowledge_base_id}" && ({" || ".join(file_conditions)})'
 
-        file_conditions = [f'file_id == "{file_id}"' for file_id in file_ids]
-        expr = f'knowledge_base_id == "{knowledge_base_id}" && ({" || ".join(file_conditions)})'
+            results = self.similarity_search_with_score_by_vector(
+                embedding=query_embedding,
+                k=k,
+                threshold=threshold,
+                expr=expr,
+                **kwargs
+            )
 
-        results = self.similarity_search_with_score_by_vector(
-            embedding=query_embedding,
-            k=k,
-            threshold=threshold,
-            expr=expr,
-            **kwargs
-        )
-
-        return results
+            return results
+        except Exception as e:
+            logger.error(f"Error in Milvus.search: {str(e)}", exc_info=True)
+            raise
 
     def similarity_search(
             self,
@@ -615,32 +703,36 @@ class Milvus():
         if param is None:
             param = self.search_params
 
-        # Determine result metadata fields with PK.
-        output_fields = self.fields[:]
-        output_fields.remove(self._vector_field)
-        timeout = self.timeout or timeout
-        # Perform the search.
-        res = self.col.search(
-            data=[embedding],
-            anns_field=self._vector_field,
-            param=param,
-            limit=k,
-            expr=expr,
-            output_fields=output_fields,
-            timeout=timeout,
-            **kwargs,
-        )
-        # Organize results.
-        ret = []
-        for result in res[0]:
-            if threshold is not None and result.score < threshold:
-                continue
+        try:
+            # Determine result metadata fields with PK.
+            output_fields = self.fields[:]
+            output_fields.remove(self._vector_field)
+            timeout = self.timeout or timeout
+            # Perform the search.
+            res = self.col.search(
+                data=[embedding],
+                anns_field=self._vector_field,
+                param=param,
+                limit=k,
+                expr=expr,
+                output_fields=output_fields,
+                timeout=timeout,
+                **kwargs,
+            )
+            # Organize results.
+            ret = []
+            for result in res[0]:
+                if threshold is not None and result.score < threshold:
+                    continue
 
-            data = {x: result.entity.get(x) for x in output_fields}
-            doc = self._parse_document(data, result.score)
-            ret.append(doc)
+                data = {x: result.entity.get(x) for x in output_fields}
+                doc = self._parse_document(data, result.score)
+                ret.append(doc)
 
-        return ret
+            return ret
+        except Exception as e:
+            logger.error(f"Error in similarity_search_with_score_by_vector: {str(e)}", exc_info=True)
+            raise
 
     def max_marginal_relevance_search(
             self,
