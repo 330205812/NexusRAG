@@ -99,11 +99,6 @@ def main():
         logger.info("Health check succeeded. The reranker server at"
                     " '{}' is responding as expected.".format(args.url))
         try:
-            # res = reranker.rerank_client(pairs=args.pairs)
-            # if res:
-            #     logger.info(f"scores: '{res}'")
-            # else:
-            #     logger.warning("None")
 
             res1 = reranker.v1_rerank(
                 query=args.query,
