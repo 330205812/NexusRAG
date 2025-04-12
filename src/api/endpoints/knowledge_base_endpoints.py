@@ -1,6 +1,7 @@
 import os
 import asyncio
 import threading
+import aiofiles
 from loguru import logger
 from typing import List, Optional
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
@@ -20,6 +21,7 @@ from models.models import (
     FileStatusRequest, BatchFileStatusResponse,
     FileStatusItem
 )
+from main import API_EXECUTOR, LIGHT_EXECUTOR
 
 try:
     from pymilvus import connections, utility, exceptions
@@ -74,11 +76,16 @@ async def create_knowledge_base(request: CreateKnowledgeBaseRequest):
     """
     knowledgebase_service = ServiceManager.get_knowledge_base_service()
     try:
-        kb_id, milvus_is_new, es_is_new = knowledgebase_service.create_knowledge_base(
-            user_id=request.user_id,
-            name=request.name,
-            vector_model_url=request.vector_model_url,
-            vector_model_name=request.vector_model_name
+        loop = asyncio.get_running_loop()
+
+        kb_id, milvus_is_new, es_is_new = await loop.run_in_executor(
+            API_EXECUTOR,
+            lambda: knowledgebase_service.create_knowledge_base(
+                user_id=request.user_id,
+                name=request.name,
+                vector_model_url=request.vector_model_url,
+                vector_model_name=request.vector_model_name
+            )
         )
         return CreateKnowledgeBaseResponse(ID=kb_id, milvus_is_new=milvus_is_new, es_is_new=es_is_new)
     except Exception as e:
@@ -142,68 +149,65 @@ async def add_files(file: UploadFile = File(...),
     - Supports custom vector models for embedding if URL and name provided
     """
     knowledgebase_service = ServiceManager.get_knowledge_base_service()
-    if vector_model_url and vector_model_name:
-        milvus_host, milvus_port = knowledgebase_service.milvus_address.split(":")
-        collection_name = knowledge_base_id
+    loop = asyncio.get_running_loop()
+    try:
+        # checkout the path
+        knowledge_id_dir_uploads = os.path.join(knowledgebase_service.uploads_dir, knowledge_base_id)
+        knowledge_id_dir_processed = os.path.join(knowledgebase_service.processed_dir, knowledge_base_id)
+        file_status_dir = os.path.join(knowledge_id_dir_uploads, 'file_status')
 
-        try:
-            connections.connect(
-                alias="default",
-                host=milvus_host,
-                port=milvus_port
-            )
+        paths_exist = await loop.run_in_executor(
+            LIGHT_EXECUTOR,
+            lambda: all(os.path.exists(path) for path in
+                        [knowledge_id_dir_uploads, knowledge_id_dir_processed, file_status_dir])
+        )
 
-            collections = utility.list_collections()
-            if collection_name not in collections:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Knowledge base does not exist. Please create it first"
-                )
-
-        except exceptions.ConnectionConfigException as e:
-            logger.error(f"Failed to connect to Milvus: {e}")
-            raise HTTPException(status_code=500, detail=f"Unable to connect to vector database: {e}")
-
-        except HTTPException as e:
-            raise
-
-        except Exception as e:
-            logger.error(f"Error occurred while checking knowledge base: {e}")
-            raise HTTPException(status_code=500, detail=f"Error occurred while checking knowledge base: {e}")
-
-        finally:
-            connections.disconnect("default")
-    # checkout the path
-    knowledge_id_dir_uploads = os.path.join(knowledgebase_service.uploads_dir, knowledge_base_id)
-    knowledge_id_dir_processed = os.path.join(knowledgebase_service.processed_dir, knowledge_base_id)
-    file_status_dir = os.path.join(knowledge_id_dir_uploads, 'file_status')
-    if not all(
-            os.path.exists(path) for path in [knowledge_id_dir_uploads, knowledge_id_dir_processed, file_status_dir]):
-        raise ValueError(
-            "Knowledge base directories does not exist, please check if the knowledge base ID is correct or recreate the knowledge base.")
+        if not paths_exist:
+            raise ValueError(
+                "Knowledge base directories does not exist, please check if the knowledge base ID is correct or recreate the knowledge base.")
+    except Exception as e:
+        logger.error(f"Error validating paths: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
     logger.info(f"Starting to receive file: {file.filename}")
-    # logger.debug(f'file.filename:{file.filename}')
-    file_name_without_ext = sanitize_filename(os.path.splitext(file.filename)[0])
-    # logger.debug(f'file_name_without_ext:{file_name_without_ext}')
-    file_specific_dir_before_process = os.path.join(knowledge_id_dir_uploads, file_name_without_ext)
-    file_specific_dir_after_process = os.path.join(knowledge_id_dir_processed, file_name_without_ext)
+
+    root, ext = os.path.splitext(file.filename)
+    file_name_without_ext = sanitize_filename(root)
+
+    file_specific_dir_before_process = os.path.join(knowledge_id_dir_uploads,
+                                                    file_name_without_ext) + "_" + f"{ext[1:]}"
+    file_specific_dir_after_process = os.path.join(knowledge_id_dir_processed,
+                                                   file_name_without_ext) + "_" + f"{ext[1:]}"
 
     os.makedirs(file_specific_dir_before_process, exist_ok=True)
     os.makedirs(file_specific_dir_after_process, exist_ok=True)
 
     file_path = os.path.join(file_specific_dir_before_process, file.filename)
 
+    temp_file_path = file_path + '.tmp'
     try:
-        with open(file_path, "wb") as buffer:
-            while content := await file.read(16 * 1024 * 1024):
-                buffer.write(content)
+        CHUNK_SIZE = 64 * 1024 * 1024
+        async with aiofiles.open(temp_file_path, "wb") as buffer:
+            while True:
+                chunk = await file.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                await buffer.write(chunk)
+                await asyncio.sleep(0)
+
+        os.rename(temp_file_path, file_path)
         logger.info(f"File saved successfully: {file_path}")
     except Exception as e:
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
         logger.error(f"Failed to save file: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
 
-    files = knowledgebase_service.file_processor.scan_directory(file_specific_dir_before_process)
+    files = await loop.run_in_executor(
+        LIGHT_EXECUTOR,
+        lambda: knowledgebase_service.file_processor.scan_directory(file_specific_dir_before_process)
+    )
+
     if not files:
         raise HTTPException(status_code=500, detail="Failed to generate file ID")
 
@@ -217,20 +221,22 @@ async def add_files(file: UploadFile = File(...),
                            operation='write',
                            status='pending')
     try:
+        coroutine = process_and_update_status(
+            file_ids,
+            files,
+            file_specific_dir_after_process,
+            knowledge_base_id,
+            file_status_dir,
+            is_md_splitter,
+            vector_model_url,
+            vector_model_name,
+            chunk_size
+        )
         thread = threading.Thread(
             target=run_async_function,
-            args=(process_and_update_status(
-                file_ids,
-                files,
-                file_specific_dir_after_process,
-                knowledge_base_id,
-                file_status_dir,
-                is_md_splitter,
-                vector_model_url,
-                vector_model_name,
-                chunk_size
-            ),)
+            args=(coroutine,)
         )
+        thread.daemon = True
         thread.start()
 
         logger.info(f"File upload completed, starting background processing: {file_ids}")
@@ -244,10 +250,11 @@ async def add_files(file: UploadFile = File(...),
             pass
 
     except Exception as e:
-        logger.error(f"Error occurred during background process: {e}")
+        error_msg = f"Error occurred during background process: {e}"
+        logger.error(error_msg)
 
         for file_id in file_ids:
-            handle_status_file(file_status_dir, file_id, operation='write', status='error')
+            handle_status_file(file_status_dir, file_id, operation='write', status='error', error_msg=error_msg)
         raise HTTPException(status_code=500, detail=f"Error occurred during background process: {e}")
 
 
@@ -274,8 +281,17 @@ async def process_and_update_status(file_ids: List[str],
                                     chunk_size: Optional[int] = None):
 
     knowledgebase_service = ServiceManager.get_knowledge_base_service()
+
     try:
-        successful_files, failed_files = knowledgebase_service.add_files(
+
+        for file_obj in files:
+            file_id = file_obj.file_id
+            handle_status_file(path,
+                               file_id,
+                               operation='write',
+                               status='analyzing')
+
+        successful_files, failed_files, error_msg = await knowledgebase_service.add_files(
             files=files,
             work_dir=work_dir,
             knowledge_base_id=knowledge_base_id,
@@ -295,12 +311,15 @@ async def process_and_update_status(file_ids: List[str],
             handle_status_file(path,
                                file_id,
                                operation='write',
-                               status='error')
+                               status='error',
+                               error_msg=error_msg)
 
         logger.info(f"File processing completed: {successful_files} succeeded, {failed_files} failed")
 
     except Exception as e:
-        logger.error(f"Error occurred while processing file: {e}")
+        error_msg = f"Error occurred while processing file: {e}"
+        logger.error(error_msg)
+
         for file_id in file_ids:
             try:
                 max_retries = 3
@@ -309,7 +328,8 @@ async def process_and_update_status(file_ids: List[str],
                         handle_status_file(path,
                                            file_id,
                                            operation='write',
-                                           status='error')
+                                           status='error',
+                                           error_msg=error_msg)
                         break
                     except Exception as retry_error:
                         if attempt == max_retries - 1:
@@ -359,33 +379,45 @@ async def batch_file_parse_result(requests: List[FileStatusRequest]):
     """
 
     knowledgebase_service = ServiceManager.get_knowledge_base_service()
+    loop = asyncio.get_running_loop()
     results = []
     for request in requests:
         try:
-            knowledge_id_dir_origin, _ = knowledgebase_service._get_knowledge_dirs(
-                knowledge_id=request.knowledge_base_id,
-                mode='query'
+            knowledge_dirs = await loop.run_in_executor(
+                LIGHT_EXECUTOR,
+                lambda: knowledgebase_service._get_knowledge_dirs(
+                    knowledge_id=request.knowledge_base_id,
+                    mode='query'
+                )
             )
 
+            knowledge_id_dir_origin, _ = knowledge_dirs
             file_status_dir = os.path.join(knowledge_id_dir_origin, 'file_status')
             status_file = os.path.join(file_status_dir, f"{request.file_id}.status")
 
             status = ""
+            msg = "Status file not found"
+
             if os.path.exists(status_file):
                 try:
-                    status = handle_status_file(
-                        file_status_dir,
-                        request.file_id,
-                        operation='read'
+                    status, msg = await loop.run_in_executor(
+                        LIGHT_EXECUTOR,
+                        lambda: handle_status_file(
+                            file_status_dir,
+                            request.file_id,
+                            operation='read'
+                        )
                     )
                 except Exception as e:
                     logger.error(f"Error reading status for file {request.file_id}: {e}")
                     status = ""
+                    msg = f"Error reading status for file {request.file_id}: {e}"
 
             results.append(FileStatusItem(
                 knowledge_base_id=request.knowledge_base_id,
                 file_id=request.file_id,
-                status=status
+                status=status,
+                error_msg=msg
             ))
 
         except Exception as e:
@@ -393,7 +425,8 @@ async def batch_file_parse_result(requests: List[FileStatusRequest]):
             results.append(FileStatusItem(
                 knowledge_base_id=request.knowledge_base_id,
                 file_id=request.file_id,
-                status=""
+                status="",
+                error_msg=f"Error processing request for file {request.file_id}: {e}"
             ))
 
     return BatchFileStatusResponse(results=results)
@@ -440,14 +473,18 @@ async def delete(request: DeleteRequest):
 
     knowledgebase_service = ServiceManager.get_knowledge_base_service()
     try:
+        loop = asyncio.get_running_loop()
         chunk_id = request.chunk_id
         if chunk_id == "":
             chunk_id = None
 
-        res = knowledgebase_service.delete(
-            knowledge_base_id=request.knowledge_base_id,
-            file_id=request.file_id,
-            chunk_id=chunk_id
+        res = await loop.run_in_executor(
+            API_EXECUTOR,
+            lambda: knowledgebase_service.delete(
+                knowledge_base_id=request.knowledge_base_id,
+                file_id=request.file_id,
+                chunk_id=chunk_id
+            )
         )
 
         return res
@@ -506,24 +543,30 @@ async def search(request: SearchRequest):
     knowledgebase_service = ServiceManager.get_knowledge_base_service()
     search_results = []
     keywords = []
+    loop = asyncio.get_running_loop()
 
     try:
         normalized_search_mode = request.search_mode.normalize()
-        results, keywords, error_message = knowledgebase_service.search(
-            knowledge_base_id=request.knowledge_base_id,
-            query=request.query,
-            file_ids=request.file_ids,
-            vector_model_name=request.vector_model_name,
-            vector_model_url=request.vector_model_url,
-            search_mode=normalized_search_mode,
-            using_rerank=request.using_rerank,
-            reranker_model_name=request.reranker_model_name,
-            reranker_model_url=request.reranker_model_url,
-            top_k=request.top_k,
-            threshold=request.threshold,
-            weights=request.weights
+
+        search_result = await loop.run_in_executor(
+            API_EXECUTOR,
+            lambda: knowledgebase_service.search(
+                knowledge_base_id=request.knowledge_base_id,
+                query=request.query,
+                file_ids=request.file_ids,
+                vector_model_name=request.vector_model_name,
+                vector_model_url=request.vector_model_url,
+                search_mode=normalized_search_mode,
+                using_rerank=request.using_rerank,
+                reranker_model_name=request.reranker_model_name,
+                reranker_model_url=request.reranker_model_url,
+                top_k=request.top_k,
+                threshold=request.threshold,
+                weights=request.weights
+            )
         )
 
+        results, keywords, error_message = search_result
         logger.debug(results)
 
         for doc in results:
@@ -532,7 +575,8 @@ async def search(request: SearchRequest):
                 knowledge_base_id=doc.metadata.get("knowledge_base_id", ""),
                 file_id=doc.metadata.get("file_id", ""),
                 chunk_id=doc.metadata.get("chunk_id", ""),
-                score=doc.metadata.get("relevance_score", 0.0)
+                score=doc.metadata.get("relevance_score", 0.0),
+                title=doc.metadata.get("file_name", "")
             )
             search_results.append(search_result)
 
@@ -588,22 +632,28 @@ async def update_chunk(request: UpdateChunkRequest):
         - 500 status code if update operation fails
     """
     knowledgebase_service = ServiceManager.get_knowledge_base_service()
-    try:
 
+    try:
+        loop = asyncio.get_running_loop()
         if not request.file_id or not request.chunk_id or not request.text:
             raise HTTPException(
                 status_code=400,
                 detail="Failed to create chunk due to invalid input"
             )
 
-        es_msg, milvus_msg = knowledgebase_service.update_chunk(
-            knowledge_base_id=request.knowledge_base_id,
-            file_id=request.file_id,
-            chunk_id=request.chunk_id,
-            text=request.text,
-            vector_model_url=request.vector_model_url,
-            vector_model_name=request.vector_model_name
+        update_result = await loop.run_in_executor(
+            API_EXECUTOR,
+            lambda: knowledgebase_service.update_chunk(
+                knowledge_base_id=request.knowledge_base_id,
+                file_id=request.file_id,
+                chunk_id=request.chunk_id,
+                text=request.text,
+                vector_model_url=request.vector_model_url,
+                vector_model_name=request.vector_model_name
+            )
         )
+
+        es_msg, milvus_msg = await update_result
 
         return UpdateChunkResponse(
             file_id=request.file_id,
@@ -651,9 +701,16 @@ async def obtain_knowledge_base_info(request: ObtainRequest):
         - 500 status code for server-side errors during retrieval
     """
     knowledgebase_service = ServiceManager.get_knowledge_base_service()
+
     try:
-        result = knowledgebase_service.obtain_knowledge_base_info(request.user_id,
-                                                                  request.is_admin)
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            API_EXECUTOR,
+            lambda: knowledgebase_service.obtain_knowledge_base_info(
+                request.user_id,
+                request.is_admin
+            )
+        )
 
         return ObtainResponse(**result)
 
@@ -704,8 +761,16 @@ async def list_files_with_status(request: ListFileRequest):
     """
     knowledgebase_service = ServiceManager.get_knowledge_base_service()
     try:
-        result = knowledgebase_service.list_files_with_status(request.knowledge_base_id,
-                                                              request.is_admin)
+        loop = asyncio.get_running_loop()
+
+        result = await loop.run_in_executor(
+            LIGHT_EXECUTOR,
+            lambda: knowledgebase_service.list_files_with_status(
+                request.knowledge_base_id,
+                request.is_admin
+            )
+        )
+
         return ListFileResponse(status_dict=result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -776,12 +841,21 @@ async def list_chunks_info(request: ListChunkRequest):
     """
     knowledgebase_service = ServiceManager.get_knowledge_base_service()
     try:
-        result = knowledgebase_service.list_chunks_info(request.knowledge_base_id,
-                                                        request.file_id,
-                                                        request.chunk_id,
-                                                        request.size,
-                                                        request.offset,
-                                                        request.use_embedding_id_as_id)
+        loop = asyncio.get_running_loop()
+
+        result = await loop.run_in_executor(
+            LIGHT_EXECUTOR,
+            lambda: knowledgebase_service.list_chunks_info(
+                request.knowledge_base_id,
+                request.file_id,
+                request.chunk_id,
+                request.size,
+                request.offset,
+                request.use_embedding_id_as_id,
+                request.key
+            )
+        )
+
         return ListChunkResponse(total=result["total"], chunks=result["chunks"])
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -832,10 +906,10 @@ async def create_chunk(request: CreateChunkRequest):
     """
     knowledgebase_service = ServiceManager.get_knowledge_base_service()
     try:
-
-        result = knowledgebase_service.create_chunk(
+        result = await knowledgebase_service.create_chunk(
             knowledge_base_id=request.knowledge_base_id,
             text=request.text,
+            title=request.title,
             file_id=request.file_id,
             vector_model_url=request.vector_model_url,
             vector_model_name=request.vector_model_name
