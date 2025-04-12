@@ -1,6 +1,8 @@
 import os
 import re
+import time
 import hashlib
+from datetime import datetime
 from loguru import logger
 from filelock import FileLock, Timeout
 
@@ -68,11 +70,26 @@ def sanitize_filename(filename: str) -> str:
     return re.sub(r'[^a-zA-Z0-9_\u4e00-\u9fff-]', '_', filename)
 
 
+def get_partial_sha256_hash_from_text(text: str):
+    timestamp = time.strftime('%Y%m%d_%H%M%S')
+    hash_object = hashlib.sha256()
+    hash_object.update(text.encode('utf-8'))
+
+    return hash_object.hexdigest()[0:16] + "_" + f"{timestamp}"
+
+
 def get_partial_sha256_hash(filepath: str):
+    timestamp = time.strftime('%Y%m%d_%H%M%S')
     hash_object = hashlib.sha256()
     with open(filepath, 'rb') as file:
         chunk_size = 8192
         while chunk := file.read(chunk_size):
             hash_object.update(chunk)
 
-    return hash_object.hexdigest()[0:16]
+    return hash_object.hexdigest()[0:16] + "_" + f"{timestamp}"
+
+
+def calc_time():
+    current_time = datetime.now().astimezone()
+    rfc3339_str = current_time.isoformat()
+    return rfc3339_str

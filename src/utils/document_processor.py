@@ -1,18 +1,18 @@
+
 import fitz
 import re
 import os
 import time
 import pandas as pd
-import hashlib
 import textract
 import shutil
-import multiprocessing
-from multiprocessing import Pool
+import subprocess
+import asyncio
 from loguru import logger
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 from bs4 import BeautifulSoup
-from .markdown_text_splitter import MarkdownParser
-from .tools import get_partial_sha256_hash
+from recursive_character_text_splitter import RecursiveCharacterTextSplitter
+from markdown_text_splitter import MarkdownParser
+from tools import get_partial_sha256_hash
 
 
 class DocumentName:
@@ -48,6 +48,7 @@ class DocumentProcessor:
 
     def read_file_type(self, filepath: str):
         filepath = filepath.lower()
+
         if filepath.endswith(self.pdf_suffix):
             return 'pdf'
 
@@ -87,6 +88,7 @@ class DocumentProcessor:
         for directory, _, names in os.walk(repo_dir):
             for name in names:
                 category = self.read_file_type(name)
+                logger.info(category)
                 if category is not None:
                     documents.append(
                         DocumentName(directory=directory,
@@ -96,11 +98,12 @@ class DocumentProcessor:
 
     def read(self, filepath: str):
 
-        file_type = self.read_file_type(filepath)
-
         text = ''
         if not os.path.exists(filepath):
-            return text
+            error_message = f"Error: File '{filepath}' does not exist."
+            return text, error_message
+
+        file_type = self.read_file_type(filepath)
 
         try:
             if file_type == 'md' or file_type == 'text':
@@ -118,10 +121,7 @@ class DocumentProcessor:
                 text += self.read_excel(filepath)
 
             elif file_type == 'word' or file_type == 'ppt':
-                # https://stackoverflow.com/questions/36001482/read-doc-file-with-python
-                # https://textract.readthedocs.io/en/latest/installation.html
-                text = textract.process(filepath).decode('utf8')
-                text = re.sub(r'\n\s*\n', '\n\n', text)
+                text += self.read_word(filepath)
 
             elif file_type == 'html':
                 with open(filepath) as f:
@@ -138,18 +138,69 @@ class DocumentProcessor:
 
         return text, None
 
+    def read_word(self, filepath: str):
+        errors = []
+
+        try:
+            result = subprocess.run(['antiword', filepath],
+                                    capture_output=True,
+                                    text=True)
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout
+            errors.append("Antiword failed to extract content")
+        except Exception as e:
+            errors.append(f"Antiword error: {str(e)}")
+
+        try:
+            content = textract.process(filepath)
+            try:
+                text = content.decode('utf8')
+            except UnicodeDecodeError:
+                text = content.decode('gbk')
+            if text.strip():
+                return text
+            errors.append("Textract failed to extract content")
+        except Exception as e:
+            errors.append(f"Textract error: {str(e)}")
+
+        try:
+            process = subprocess.Popen(['catdoc', filepath],
+                                       stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE)
+            stdout, stderr = process.communicate()
+
+            for encoding in ['utf-8', 'gbk', 'gb18030']:
+                try:
+                    text = stdout.decode(encoding)
+                    if text.strip():
+                        return text
+                except UnicodeDecodeError:
+                    continue
+            errors.append("Catdoc failed to extract content")
+        except Exception as e:
+            errors.append(f"Catdoc error: {str(e)}")
+
+        error_msg = "\n".join(errors)
+        raise Exception(f"Failed to read word file using all methods:\n{error_msg}")
+
     def read_excel(self, filepath: str):
-        table = None
-        if filepath.endswith('.csv'):
-            table = pd.read_csv(filepath)
-        else:
-            table = pd.read_excel(filepath)
-        if table is None:
+        try:
+            if filepath.endswith('.csv'):
+                table = pd.read_csv(filepath)
+            elif filepath.endswith('.xls'):
+                table = pd.read_excel(filepath, engine='xlrd')
+            elif filepath.endswith(('.xlsx', '.xlsm')):
+                table = pd.read_excel(filepath, engine='openpyxl')
+            else:
+                raise ValueError("Unsupported file format")
+            json_text = table.dropna(axis=1).to_json(force_ascii=False)
+            return json_text
+        except Exception as e:
+            logger.error(f"Error reading {filepath}: {str(e)}")
             return ''
-        json_text = table.dropna(axis=1).to_json(force_ascii=False)
-        return json_text
 
     def read_pdf(self, filepath: str):
+        # load pdf and serialize table
 
         text = ''
         with fitz.open(filepath) as pages:
@@ -198,8 +249,9 @@ def read_and_save(file: DocumentName, file_opr: DocumentProcessor):
 
 
 def read_pdf_from_server(file: DocumentName,
-                         server=None,
-                         ocr_process_dir=None):
+                             server=None,
+                             ocr_process_dir=None
+                             ):
     try:
         if os.path.exists(file.copy_path):
             logger.info('{} already processed, output file: {}, skip load'
@@ -208,7 +260,6 @@ def read_pdf_from_server(file: DocumentName,
 
         logger.info('reading {} with ocr server'.format(file.origin_path))
         output_file_path = server.ocr_pdf_client(path=file.origin_path, output_dir=ocr_process_dir)
-
         if not output_file_path:
             error_msg = '{} reading error'.format(file.origin_path)
             logger.error(error_msg)
@@ -226,120 +277,184 @@ def read_pdf_from_server(file: DocumentName,
 class FeatureDataBase:
 
     def __init__(self) -> None:
+
         self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1068, chunk_overlap=32)
-        self.md_splitter = MarkdownParser(max_chunk_size=1500)
+            chunk_size=1068, chunk_overlap=100)
+        self.md_splitter = MarkdownParser(max_chunk_size=1200)
 
-    def get_split_texts(self, text):
-        # if len(text) <= 1:
-        #     return []
-        chunks = self.splitter.create_documents(text)
-        split_texts = []
-        chunks_hashes = []
-        for chunk in chunks:
-            split_texts.append(chunk.page_content)
-            hash_value = hashlib.sha256(chunk.page_content.encode('utf-8')).hexdigest()[:16]
-            chunks_hashes.append(hash_value)
-        return split_texts, chunks_hashes
-
-    def build_database(self, files: list,
-                       file_opr: DocumentProcessor,
-                       knowledge_base_id=str,
-                       is_md_splitter: bool = False,
-                       elastic_search=None,
-                       milvus=None,
-                       vector_model_name: str = None,
-                       chunk_size: int = None,
-                       chunk_size_overlap: int = None
-                       ):
+    async def build_database(self, files: list,
+                             file_opr: DocumentProcessor,
+                             knowledge_base_id: str,
+                             is_md_splitter: bool = False,
+                             elastic_search=None,
+                             milvus=None,
+                             vector_model_name: str = None,
+                             chunk_size: int = None,
+                             chunk_size_overlap: int = None
+                             ):
+        error_msg = ""
 
         if chunk_size and chunk_size_overlap:
             self.text_splitter = RecursiveCharacterTextSplitter(
                 chunk_size=chunk_size, chunk_overlap=chunk_size_overlap)
             self.md_splitter = MarkdownParser(max_chunk_size=chunk_size)
+
         if is_md_splitter:
             self.splitter = self.md_splitter
+            splitter_type = "MarkdownParser"
         else:
             self.splitter = self.text_splitter
+            splitter_type = "RecursiveCharacterTextSplitter"
 
-        texts = []
+        content_list = []
         file_id_list = []
-        chunks_ids_list = []
         unique_file_id_list = []
+        file_name_list = []
+
+        es_success_files = []
+        es_failed_files = []
+        milvus_success_files = []
+        milvus_failed_files = []
 
         for i, file in enumerate(files):
-            if not file.status:
-                continue
-            text, error = file_opr.read(file.copy_path)
+            try:
+                if not file.status:
+                    continue
 
-            if error is not None:
-                file.status = False
-                file.message = str(error)
-                continue
-            file.message = str(text[0])
-            unique_file_id_list.append(f"{file.file_id}")
+                start_read = time.time()
+                text, error = file_opr.read(file.copy_path)
+                read_time = time.time() - start_read
+                logger.info(
+                    f"File {file.basename} read time: {read_time:.2f}s, size: {os.path.getsize(file.copy_path) / 1024 / 1024:.2f}MB")
 
-            split_texts, chunks_ids = self.get_split_texts(text)
-            file_id_list_temp = [file.file_id for _ in range(len(split_texts))]
+                if error is not None:
+                    file.status = False
+                    file.message = str(error)
+                    error_msg = f"File read error for {file.basename}: {str(error)}"
+                    continue
 
-            texts += split_texts
-            file_id_list += file_id_list_temp
-            chunks_ids_list += chunks_ids
+                file.message = str(text[0])
+                unique_file_id_list.append(f"{file.file_id}")
 
-            logger.debug('Pipeline {}/{}.. register 《{}》 and split {} documents'
-                         .format(i + 1, len(files), file.basename, len(split_texts)))
+                logger.info(f"Starting create documents using {splitter_type} splitter!")
+                splitter_time_before = time.time()
+                try:
+
+                    loop = asyncio.get_running_loop()
+                    final_chunks, content_list_temp, hash_list_temp = await loop.run_in_executor(
+                        None,
+                        lambda: self.splitter.create_documents(text)
+                    )
+                except Exception as e:
+                    error_msg = f"Document splitting error for {file.basename}: {str(e)}"
+                    logger.error(f"Splitting error for file {file.basename}: {str(e)}")
+                    continue
+
+                splitter_time_after = time.time()
+                logger.debug(
+                    'Splitter take time: {} '.format(splitter_time_after - splitter_time_before))
+
+                content_list.extend(content_list_temp)
+                file_id_list.extend([file.file_id for _ in range(len(final_chunks))])
+                hash_list = hash_list_temp if not 'hash_list' in locals() else hash_list + hash_list_temp
+
+                logger.debug('Pipeline {}/{}.. register 《{}》 and split {} chunks'
+                             .format(i + 1, len(files), file.basename, len(final_chunks)))
+
+            except Exception as e:
+                error_msg = f"Processing error for {file.basename}: {str(e)}"
+                logger.error(f"Error processing file {file.basename}: {str(e)}")
+                return [], list(set(f.file_id for f in files)), error_msg
+
+        file_name_list = [f"{file.basename}" for _ in range(len(final_chunks))]
+
+        if not content_list:
+            error_msg = "No valid files to process - all files were skipped due to missing copy paths"
+            logger.warning(error_msg)
+            return [], list(set(f.file_id for f in files)), error_msg
 
         if milvus is not None:
-            logger.debug('Milvus pipeline: registering {} files (total {} chunks) to knowledge base {}'.format(
-                len(unique_file_id_list),
-                len(texts),
-                knowledge_base_id
-            ))
-            milvus_time_before_register = time.time()
-            success_ids, all_ids = milvus.add_texts(
-                knowledge_base_id=knowledge_base_id,
-                vector_model_name=vector_model_name,
-                texts=texts,
-                file_ids=file_id_list,
-                chunk_ids=chunks_ids_list,
-            )
-            milvus_time_after_register = time.time()
-            logger.debug(
-                'Milvus pipeline take time: {} '.format(milvus_time_after_register - milvus_time_before_register))
+            try:
+                logger.debug('Milvus pipeline: registering {} files (total {} chunks) to knowledge base {}'.format(
+                    len(unique_file_id_list),
+                    len(content_list),
+                    knowledge_base_id
+                ))
+                milvus_time_before_register = time.time()
+                try:
+                    success_ids = await milvus.add_texts(
+                        knowledge_base_id=knowledge_base_id,
+                        vector_model_name=vector_model_name,
+                        texts=content_list,
+                        file_ids=file_id_list,
+                        chunk_ids=hash_list,
+                        file_name_list=file_name_list
+                    )
+                finally:
+                    await milvus.close()
+                milvus_time_after_register = time.time()
+                logger.debug(
+                    'Milvus pipeline take time: {} '.format(milvus_time_after_register - milvus_time_before_register))
 
-            success_file_ids = list(dict.fromkeys(id.split("_", 2)[1] for id in success_ids))
-            all_file_ids = list(dict.fromkeys(id.split("_", 2)[1] for id in all_ids))
-            failed_file_ids = list(set(all_file_ids) - set(success_file_ids))
-            logger.debug(
-                'Milvus pipeline successfully inserted files count: {}, file ids: {}'.format(len(success_file_ids),
-                                                                                             success_file_ids))
-            logger.debug(
-                'Milvus pipeline failed inserted files count: {}, file ids: {}'.format(len(failed_file_ids),
-                                                                                       failed_file_ids))
+                success_file_ids = list(dict.fromkeys("_".join(id.split("_")[5:8]) for id in success_ids))
+                milvus_failed_files = list(set(unique_file_id_list) - set(success_file_ids))
+                milvus_success_files = success_file_ids
+
+                logger.debug(
+                    'Milvus pipeline successfully inserted files count: {}, file ids: {}'.format(
+                        len(milvus_success_files),
+                        milvus_success_files))
+                logger.debug(
+                    'Milvus pipeline failed inserted files count: {}, file ids: {}'.format(len(milvus_failed_files),
+                                                                                           milvus_failed_files))
+            except Exception as e:
+                error_msg = f"Milvus insertion error: {str(e)}"
+                logger.error(f"Milvus add_texts error: {str(e)}")
+                return [], list(set(f.file_id for f in files)), error_msg
 
         if elastic_search is not None:
-            logger.debug('ES pipeline: registering {} files (total {} chunks) to knowledge base {}'.format(
-                len(unique_file_id_list),
-                len(texts),
-                knowledge_base_id
-            ))
-            es_time_before_register = time.time()
-            ids, failed_files = elastic_search.add_texts(knowledge_base_id=knowledge_base_id,
-                                                         texts=texts,
-                                                         file_id_list=file_id_list,
-                                                         chunks_ids_list=chunks_ids_list)
-            es_time_after_register = time.time()
-            logger.debug('ES pipeline take time: {} '.format(es_time_after_register - es_time_before_register))
+            try:
+                logger.debug('ES pipeline: registering {} files (total {} chunks) to knowledge base {}'.format(
+                    len(unique_file_id_list),
+                    len(content_list),
+                    knowledge_base_id
+                ))
+                es_time_before_register = time.time()
+                ids, es_failed_files = elastic_search.add_texts(knowledge_base_id=knowledge_base_id,
+                                                                texts=content_list,
+                                                                file_id_list=file_id_list,
+                                                                chunks_ids_list=hash_list,
+                                                                file_name_list=file_name_list)
+                es_time_after_register = time.time()
+                logger.debug('ES pipeline take time: {} '.format(es_time_after_register - es_time_before_register))
 
-            successful_files = [file_id for file_id in unique_file_id_list if file_id not in failed_files]
-            logger.debug('ES pipeline successfully inserted files count: {}, file ids: {}'.format(len(successful_files),
-                                                                                                  successful_files))
-            logger.debug(
-                'ES pipeline failed inserted files count: {}, file ids: {}'.format(len(failed_files), failed_files))
+                es_success_files = [file_id for file_id in unique_file_id_list if file_id not in es_failed_files]
 
-        return successful_files, failed_files
+                logger.debug(
+                    'ES pipeline successfully inserted files count: {}, file ids: {}'.format(len(es_success_files),
+                                                                                             es_success_files))
+                logger.debug(
+                    'ES pipeline failed inserted files count: {}, file ids: {}'.format(len(es_failed_files),
+                                                                                       es_failed_files))
+            except Exception as e:
+                error_msg = f"Elasticsearch insertion error: {str(e)}"
+                logger.error(f"ES pipeline error: {str(e)}")
+                return [], list(set(f.file_id for f in files)), error_msg
 
-    def preprocess(self, files: list, work_dir: str, file_opr: DocumentProcessor, is_md_splitter: bool = False,
+        successful_files = list(set(milvus_success_files) & set(es_success_files)) if (
+                milvus is not None and elastic_search is not None) else (
+            milvus_success_files if milvus is not None else es_success_files)
+
+        failed_files = list(set(milvus_failed_files) | set(es_failed_files)) if (
+                milvus is not None and elastic_search is not None) else (
+            milvus_failed_files if milvus is not None else es_failed_files)
+
+        return successful_files, failed_files, error_msg
+
+    def preprocess(self, files: list,
+                   work_dir: str,
+                   file_opr: DocumentProcessor,
+                   is_md_splitter: bool = False,
                    server=None):
 
         """
@@ -360,13 +475,19 @@ class FeatureDataBase:
 
             elif file._category == 'pdf':
                 if server:
-                    processed_knowledge_id_dir, file_name_without_ext = os.path.split(work_dir)
-                    file.copy_path = os.path.join(work_dir,
-                                                  file_name_without_ext + '.txt')
-                    if is_md_splitter:
+                    try:
+                        processed_knowledge_id_dir, file_name_with_ext = os.path.split(work_dir)
                         file.copy_path = os.path.join(work_dir,
-                                                      file_name_without_ext + '.md')
-                    read_pdf_from_server(file, server, processed_knowledge_id_dir)
+                                                      file_name_with_ext + '.txt')
+                        if is_md_splitter:
+                            file.copy_path = os.path.join(work_dir,
+                                                          file_name_with_ext + '.md')
+
+                        read_pdf_from_server(file, server, processed_knowledge_id_dir)
+                    except Exception as e:
+                        file.status = False
+                        file.message = f'pdf processing error: {str(e)}'
+                        raise Exception(f"Failed to process PDF file {file.file_id}: {str(e)}")
                 else:
                     file.copy_path = os.path.join(work_dir,
                                                   '{}.text'.format(file.file_id))
@@ -410,111 +531,24 @@ class FeatureDataBase:
                     file.status = False
                     file.message = 'read error'
 
-    def async_preprocess(self, files: list, work_dir: str, file_opr: DocumentProcessor,
-                         is_md_splitter: bool = False, server=None, processes=16, timeout=3600):
+    def initialize(self,
+                   files: list,
+                   work_dir: str,
+                   file_opr: DocumentProcessor,
+                   is_md_splitter: bool,
+                   knowledge_base_id: str,
+                   elastic_search=None,
+                   milvus=None,
+                   server=None):
 
-        """
-        Asynchronously preprocess files using a process pool.
-
-        Args:
-            files: List of files to be processed
-            work_dir: Working directory for storing processed files
-            file_opr: Document processor instance for handling file operations
-            is_md_splitter: Whether to use markdown splitter
-            server: PDF server instance for processing PDF files
-            processes: Number of processes in the pool (default: 16)
-            timeout: Timeout in seconds for each task (default: 3600)
-
-        Notes:
-            - For PDF files, OCR results are stored in work_dir/ocr_process/
-            - Other document processing results are stored in work_dir/preprocess/
-            - Both directories are created if they don't exist
-            - Supports file types: PDF, Word, PPT, HTML, Excel, JSON, Markdown, Text
-            - Skips image files and unknown formats
-        """
-        async_results = []
-        pool = Pool(processes=processes)
-
-        for idx, file in enumerate(files):
-            if not os.path.exists(file.origin_path):
-                file.status = False
-                file.message = 'skip not exist'
-                continue
-
-            if file._category == 'image':
-                file.status = False
-                file.message = 'skip image'
-
-            elif file._category == 'pdf':
-                if server:
-                    processed_knowledge_id_dir, file_name_without_ext = os.path.split(work_dir)
-                    file.copy_path = os.path.join(work_dir,
-                                                  file_name_without_ext + '.txt')
-                    if is_md_splitter:
-                        file.copy_path = os.path.join(work_dir,
-                                                      file_name_without_ext + '.md')
-                    result = pool.apply_async(read_pdf_from_server,
-                                              args=(file, server, processed_knowledge_id_dir))
-                    async_results.append((file, result))
-                else:
-                    file.copy_path = os.path.join(work_dir,
-                                                  '{}.text'.format(file.file_id))
-                    result = pool.apply_async(read_and_save, args=(file, file_opr))
-                    async_results.append((file, result))
-
-            elif file._category in ['word', 'ppt', 'html', 'excel', 'json']:
-                file.copy_path = os.path.join(work_dir,
-                                              '{}.text'.format(file.file_id))
-                result = pool.apply_async(read_and_save, args=(file, file_opr))
-                async_results.append((file, result))
-
-            elif file._category in ['md', 'text']:
-                file.copy_path = os.path.join(work_dir,
-                                              '{}.text'.format(file.file_id))
-
-                if os.path.exists(file.copy_path):
-                    logger.info('{} already processed, output file: {}, skip'
-                                .format(file.origin_path, file.copy_path))
-                    file.status = True
-                    file.message = 'preprocessed'
-                else:
-                    try:
-                        shutil.copy2(file.origin_path, file.copy_path)
-                        file.status = True
-                        file.message = 'preprocessed'
-                    except Exception as e:
-                        file.status = False
-                        file.message = str(e)
-            else:
-                file.status = False
-                file.message = 'skip unknown format'
-
-        pool.close()
-        logger.debug('waiting for preprocess read finish..')
-
-        for file, result in async_results:
-            try:
-                result.get(timeout=timeout)
-                if os.path.exists(file.copy_path):
-                    file.status = True
-                    file.message = 'preprocessed'
-            except multiprocessing.TimeoutError:
-                logger.error(f"Task timeout for file {file.origin_path}")
-                file.status = False
-                file.message = 'Task timeout'
-            except Exception as e:
-                logger.error(f"Error processing file {file.origin_path}: {str(e)}")
-                file.status = False
-                file.message = str(e)
-
-        pool.join()
-
-        # check process result
-        for file in files:
-            if file._category in ['pdf', 'word', 'excel', 'json']:
-                if os.path.exists(file.copy_path):
-                    file.status = True
-                    file.message = 'preprocessed'
-                else:
-                    file.status = False
-                    file.message = 'read error'
+        self.preprocess(files=files,
+                        work_dir=work_dir,
+                        file_opr=file_opr,
+                        server=server)
+        self.build_database(files=files,
+                            file_opr=file_opr,
+                            knowledge_base_id=knowledge_base_id,
+                            is_md_splitter=is_md_splitter,
+                            elastic_search=elastic_search,
+                            milvus=milvus
+                            )

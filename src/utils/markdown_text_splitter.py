@@ -1,8 +1,10 @@
 import typing
-from typing import Any, Dict, List, Tuple, TypedDict,Optional
+from typing import Any, Dict, List, Tuple, TypedDict, Optional
 from langchain_text_splitters.character import RecursiveCharacterTextSplitter
 from langchain_core.documents.base import Document
 from abc import ABC, abstractmethod
+from tqdm.auto import tqdm
+import hashlib
 
 
 class LineType(TypedDict):
@@ -10,11 +12,13 @@ class LineType(TypedDict):
     metadata: Dict[str, str]
     content: str
 
+
 class HeaderType(TypedDict):
     """Header type as typed dict."""
     level: int
     name: str
     data: str
+
 
 class MarkdownTextSplitter(RecursiveCharacterTextSplitter):
     """Attempts to split the text along Markdown-formatted headings."""
@@ -29,10 +33,10 @@ class MarkdownHeaderTextSplitter:
     """Splitting markdown files based on specified headers."""
 
     def __init__(
-        self,
-        headers_to_split_on: List[Tuple[str, str]],
-        return_each_line: bool = False,
-        strip_headers: bool = True,
+            self,
+            headers_to_split_on: List[Tuple[str, str]],
+            return_each_line: bool = False,
+            strip_headers: bool = True,
     ):
         """Create a new MarkdownHeaderTextSplitter.
 
@@ -60,20 +64,20 @@ class MarkdownHeaderTextSplitter:
 
         for line in lines:
             if (
-                aggregated_chunks
-                and aggregated_chunks[-1]["metadata"] == line["metadata"]
+                    aggregated_chunks
+                    and aggregated_chunks[-1]["metadata"] == line["metadata"]
             ):
                 # If the last line in the aggregated list
                 # has the same metadata as the current line,
                 # append the current content to the last lines's content
                 aggregated_chunks[-1]["content"] += "  \n" + line["content"]
             elif (
-                aggregated_chunks
-                and aggregated_chunks[-1]["metadata"] != line["metadata"]
-                # may be issues if other metadata is present
-                and len(aggregated_chunks[-1]["metadata"]) < len(line["metadata"])
-                and aggregated_chunks[-1]["content"].split("\n")[-1][0] == "#"
-                and not self.strip_headers
+                    aggregated_chunks
+                    and aggregated_chunks[-1]["metadata"] != line["metadata"]
+                    # may be issues if other metadata is present
+                    and len(aggregated_chunks[-1]["metadata"]) < len(line["metadata"])
+                    and aggregated_chunks[-1]["content"].split("\n")[-1][0] == "#"
+                    and not self.strip_headers
             ):
                 # If the last line in the aggregated list
                 # has different metadata as the current line,
@@ -139,9 +143,9 @@ class MarkdownHeaderTextSplitter:
             for sep, name in self.headers_to_split_on:
                 # Check if line starts with a header that we intend to split on
                 if stripped_line.startswith(sep) and (
-                    # Header with no text OR header is followed by space
-                    # Both are valid conditions that sep is being used a header
-                    len(stripped_line) == len(sep) or stripped_line[len(sep)] == " "
+                        # Header with no text OR header is followed by space
+                        # Both are valid conditions that sep is being used a header
+                        len(stripped_line) == len(sep) or stripped_line[len(sep)] == " "
                 ):
                     # Ensure we are tracking the header as metadata
                     if name is not None:
@@ -150,8 +154,8 @@ class MarkdownHeaderTextSplitter:
 
                         # Pop out headers of lower or same level from the stack
                         while (
-                            header_stack
-                            and header_stack[-1]["level"] >= current_header_level
+                                header_stack
+                                and header_stack[-1]["level"] >= current_header_level
                         ):
                             # We have encountered a new header
                             # at the same or higher level
@@ -165,7 +169,7 @@ class MarkdownHeaderTextSplitter:
                         header: HeaderType = {
                             "level": current_header_level,
                             "name": name,
-                            "data": stripped_line[len(sep) :].strip(),
+                            "data": stripped_line[len(sep):].strip(),
                         }
                         header_stack.append(header)
                         # Update initial_metadata with the current header
@@ -227,11 +231,11 @@ class BaseParser(ABC):
 
     @abstractmethod
     async def get_chunks(
-        self,
-        filepath: str,
-        metadata: Optional[dict],
-        *args,
-        **kwargs,
+            self,
+            filepath: str,
+            metadata: Optional[dict],
+            *args,
+            **kwargs,
     ) -> typing.List[Document]:
         """
         Abstract method. This should asynchronously read a file and return its content in chunks.
@@ -244,9 +248,11 @@ class BaseParser(ABC):
         """
         pass
 
+
 def contains_text(text):
     # Check if the token contains at least one alphanumeric character
     return any(char.isalnum() for char in text)
+
 
 class MarkdownParser(BaseParser):
     """
@@ -261,30 +267,33 @@ class MarkdownParser(BaseParser):
         Initializes the MarkdownParser object.
         """
         self.max_chunk_size = max_chunk_size
+
     def create_documents(
-        self,
-        content,
+            self,
+            content,
     ) -> typing.List[Document]:
         chunks = []
         if type(content) == list:
-
             for one_content in content:
                 chunks.extend(self.get_chunks(one_content))
             return chunks
         else:
             return self.get_chunks(content)
 
-
     def get_chunks(
-        self,
-        content: str,
-        *args,
-        **kwargs,
-    ) -> typing.List[Document]:
+            self,
+            content: str,
+            *args,
+            **kwargs,
+    ) -> typing.Tuple[typing.List[Document], typing.List[str], typing.List[str]]:
         """
         Extracts chunks of content from a given Markdown file.
+        Returns:
+            - final_chunks: List[Document] - All Document
+            - content_list: List[str] - All page_content
+            - hash_list: List[str] - All hash_value
         """
-        # Define the header patterns to split on (e.g., "# Header 1", "## Header 2", "### Header 3").
+
         headers_to_split_on = [
             ("#", "Header1"),
             ("##", "Header2"),
@@ -295,53 +304,68 @@ class MarkdownParser(BaseParser):
             content, {}, 0, headers_to_split_on, self.max_chunk_size
         )
         final_chunks = []
+        content_list = []
+        hash_list = []
         lastAddedChunkSize = self.max_chunk_size + 1
-        for chunk in chunks_arr:
+
+        for chunk in tqdm(chunks_arr, desc="Processing markdown splitter"):
             page_content = self._include_headers_in_content(
                 content=chunk.page_content,
                 metadata=chunk.metadata,
             )
-            # page_content = chunk.page_content
             chunk_length = len(page_content)
+
             if chunk_length + lastAddedChunkSize <= self.max_chunk_size:
                 lastAddedChunk: Document = final_chunks.pop()
+                content_list.pop()
+                hash_list.pop()
+
                 lastAddedChunk.page_content = (
                     f"{lastAddedChunk.page_content}\n{page_content}"
                 )
+                hash_value = hashlib.sha256(
+                    lastAddedChunk.page_content.encode('utf-8')
+                ).hexdigest()[:16]
+                lastAddedChunk.metadata['hash_value'] = hash_value
+
                 final_chunks.append(lastAddedChunk)
+                content_list.append(lastAddedChunk.page_content)
+                hash_list.append(hash_value)
                 lastAddedChunkSize = chunk_length + lastAddedChunkSize
                 continue
+
             lastAddedChunkSize = chunk_length
             if contains_text(page_content):
-                final_chunks.append(
-                    Document(
-                        page_content=page_content,
-                        metadata=chunk.metadata,
-                    )
-                )
+                hash_value = hashlib.sha256(
+                    page_content.encode('utf-8')
+                ).hexdigest()[:16]
+                chunk.metadata['hash_value'] = hash_value
 
-        return final_chunks
+                new_doc = Document(
+                    page_content=page_content,
+                    metadata=chunk.metadata,
+                )
+                final_chunks.append(new_doc)
+                content_list.append(page_content)
+                hash_list.append(hash_value)
+
+        return final_chunks, content_list, hash_list
 
     def _include_headers_in_content(self, content: str, metadata: dict):
-        # 获取以 "Header" 开头的键
-        # header_keys = [key for key in metadata.keys() if key.startswith('Header')]
-        # # 提取数字部分并找到最大值
-        # max_header = max(header_keys, key=lambda k: int(k[6:])) if header_keys else None
-        # logger.info(f'content:\n{content}')
-        # logger.info(f'metadata:\n{metadata}')
+
         if "Header4" in metadata and metadata["Header4"] not in content:
-                content = "#### " + metadata["Header4"] + "\n" + content
+            content = "#### " + metadata["Header4"] + "\n" + content
         elif "Header3" in metadata and metadata["Header3"] not in content:
-                content = "### " + metadata["Header3"] + "\n" + content
+            content = "### " + metadata["Header3"] + "\n" + content
         elif "Header2" in metadata and metadata["Header2"] not in content:
-                content = "## " + metadata["Header2"] + "\n" + content
+            content = "## " + metadata["Header2"] + "\n" + content
         elif "Header1" in metadata and metadata["Header1"] not in content:
-                content = "# " + metadata["Header1"] + "\n" + content
-        # logger.info(f'content:\n{content}')
-        # logger.info(f'metadata:\n{metadata}')
+            content = "# " + metadata["Header1"] + "\n" + content
+
         return content
 
     def _recurse_split(self, content, metadata, i, headers_to_split_on, max_chunk_size):
+        headers_len = len(headers_to_split_on)
         if i >= len(headers_to_split_on):
             # Use Markdown Text Splitter in this case
             text_splitter = MarkdownTextSplitter(
@@ -361,16 +385,12 @@ class MarkdownParser(BaseParser):
             return chunks_arr
         markdown_splitter = MarkdownHeaderTextSplitter(
             headers_to_split_on=headers_to_split_on[i:i + 1],
-            strip_headers=False,
-            # return_each_line=True
+            strip_headers=False
         )
         md_header_splits = markdown_splitter.split_text(content)
-        # for head in md_header_splits:
-        #     logger.info(f'head:\n{head.metadata}')
         chunks_arr = []
         for document in md_header_splits:
             document.metadata.update(metadata)
-            # logger.info(f'document.page_content:{document.metadata}')
             chunk_length = len(document.page_content)
             if chunk_length <= max_chunk_size and contains_text(document.page_content):
                 chunks_arr.append(
@@ -384,7 +404,7 @@ class MarkdownParser(BaseParser):
                 self._recurse_split(
                     document.page_content,
                     document.metadata,
-                    i+1,
+                    i + 1,
                     headers_to_split_on,
                     max_chunk_size,
                 )
