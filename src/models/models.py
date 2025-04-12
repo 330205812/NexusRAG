@@ -5,9 +5,12 @@ from pydantic import BaseModel, Field, PositiveInt
 from dataclasses import dataclass
 
 __all__ = ['KnowledgeBaseType', 'CreateKnowledgeBaseRequest', 'CreateKnowledgeBaseResponse',
-           'AddFileRequest', 'AddFileResponse', 'FileStatusRequest', 'BatchFileStatusResponse',
-           'DeleteRequest', 'DeleteResponse', 'SearchMode', 'SearchResult', 'SearchRequest',
-           'SearchResponse']
+           'AddFileRequest', 'AddFileResponse', 'FileStatusRequest', 'FileStatusItem',
+           'BatchFileStatusResponse', 'DeleteRequest', 'DeleteResponse', 'SearchMode',
+           'SearchResult', 'SearchRequest', 'SearchResponse', 'UpdateChunkRequest',
+           'UpdateChunkResponse', 'ObtainRequest', 'ObtainResponse', 'ListFileResponse',
+           'ListFileRequest', 'ListChunkRequest', 'ListChunkResponse', 'CreateChunkRequest',
+           'CreateChunkResponse']
 
 
 class KnowledgeBaseType(str, Enum):
@@ -52,6 +55,7 @@ class FileStatusItem(BaseModel):
     knowledge_base_id: str
     file_id: str
     status: str
+    error_msg: str
 
 
 class BatchFileStatusResponse(BaseModel):
@@ -95,6 +99,7 @@ class SearchResult(BaseModel):
     file_id: str
     chunk_id: str
     score: float
+    title: str
 
 
 class SearchResponse(BaseModel):
@@ -161,6 +166,7 @@ class ListChunkRequest(BaseModel):
     size: Optional[int] = None
     offset: Optional[int] = None
     use_embedding_id_as_id: Optional[bool] = True
+    key: Optional[str] = None
 
 
 class ListChunkResponse(BaseModel):
@@ -172,6 +178,7 @@ class CreateChunkRequest(BaseModel):
     knowledge_base_id: str = Field(..., description="Knowledge base identifier")
     text: str = Field(..., description="Text content to be chunked")
     file_id: Optional[str] = Field(None, description="Optional file identifier")
+    title: str = Field(..., description="Title of content")
     vector_model_url: Optional[str] = Field(None, description="URL for the vector model")
     vector_model_name: Optional[str] = Field(None, description="Name of the vector model")
 
