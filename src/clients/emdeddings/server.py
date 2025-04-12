@@ -1,7 +1,5 @@
 import os
 import math
-import numpy as np
-import torch
 from pydantic import BaseModel
 from typing import Optional
 from enum import Enum
@@ -10,6 +8,7 @@ from typing import Any, List
 import configparser
 import uvicorn
 import argparse
+import asyncio
 from fastapi import FastAPI, HTTPException, Request
 
 app = FastAPI()
@@ -76,42 +75,6 @@ class Embedder:
             return False
         return True
 
-    def embed_query(self, text: str = None, image: str = None) -> np.ndarray:
-        """Embed input text or image as feature, output np.ndarray with np.float32"""
-        if self.bge:
-            with torch.no_grad():
-                feature = self.client.encode(text=text, image=image)
-                return feature.cpu().numpy().astype(np.float32)
-        else:
-            if text is None:
-                raise ValueError('This model only support text')
-            emb = self.client.encode([text], show_progress_bar=True, normalize_embeddings=True)
-            emb = emb.astype(np.float32)
-            for norm in np.linalg.norm(emb, axis=1):
-                assert abs(norm - 1) < 0.001
-            return emb
-
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        """Compute doc embeddings using a HuggingFace transformer model.
-
-        Args:
-            texts: The list of texts to embed.
-
-        Returns:
-            List of embeddings, one for each text.
-        """
-
-        texts = list(map(lambda x: x.replace("\n", " "), texts))
-
-        embeddings = self.client.encode(
-            texts,
-            show_progress_bar=True,
-            batch_size=self.batch_size,
-            normalize_embeddings=True
-        )
-
-        return embeddings.tolist()
-
     def v1_embeddings(self, model: str, input: List[str]):
 
         embeddings = self.client.encode(
@@ -159,39 +122,6 @@ def embedder_serve(args: str):
     uvicorn.run(app, host="0.0.0.0", port=embedding_bind_port)
 
 
-@app.post("/embed_query")
-async def embed_query(request: QueryRequest):
-    try:
-        query = request.query
-        image = request.image
-
-        embedding = embedder.embed_query(text=query, image=image)
-
-        logger.debug(f"query: {query}")
-        logger.debug(f"embedding: {embedding}")
-        logger.debug(f"embedding shape: {embedding.shape}")
-        return {"embedding": embedding.tolist()}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/embed_documents")
-async def embed_documents(request: DocumentsRequest):
-    try:
-        texts = request.texts
-        embedding_list = embedder.embed_documents(texts)
-
-        embedding_list_np = np.array(embedding_list)
-        logger.info(f"texts: {texts}")
-        logger.info(f"Shape: {embedding_list_np.shape}")
-
-        return {"embedding_list": embedding_list}
-
-    except Exception as e:
-        logger.error(f"Error in embed_documents: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @app.post("/v1/embeddings")
 async def v1_embeddings(request: Request):
     try:
@@ -202,7 +132,12 @@ async def v1_embeddings(request: Request):
         if not model or not input_texts:
             raise HTTPException(status_code=400, detail="Missing model or input parameter")
 
-        result = embedder.v1_embeddings(model, input_texts)
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            embedder.v1_embeddings,
+            model,
+            input_texts
+        )
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -225,7 +160,7 @@ def parse_args():
         default=None)
     parser.add_argument(
         '--batch_size',
-        default=32)
+        default=64)
     args = parser.parse_args()
     return args
 

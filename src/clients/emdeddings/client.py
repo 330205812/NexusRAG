@@ -3,108 +3,110 @@ from typing import List
 from loguru import logger
 import numpy as np
 import argparse
+import asyncio
+import aiohttp
 from urllib3.util import Retry
 from requests.adapters import HTTPAdapter
 
 
-class EmbedderClient:
-    def __init__(self, api_url):
+class AsyncEmbedderClient:
+    def __init__(self, api_url: str, batch_size: int = 32):
         self.api_url = api_url
+        self.timeout = 60
+        self._session = None
+        self._session_lock = asyncio.Lock()
+        self.batch_size = max(1, batch_size)
+        self._closed = False
 
-    def check_health(self):
-        health_check_url = f"{self.api_url}/health"
-        try:
-            response = requests.get(health_check_url)
-            if response.status_code == 200:
-                logger.info("Server is healthy and ready to process requests.")
-                return True
-            else:
-                logger.error(f"Server health check failed with status code: {response.status_code}")
-                return False
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Health check request failed: {e}")
-            return False
+    async def get_session(self):
+        """Lazy load session"""
+        if self._closed:
+            raise RuntimeError("Session is closed")
 
-    def embed_documents(self, texts):
-        payload = {
-            "texts": texts,
-        }
-        headers = {'Content-Type': 'application/json'}
-        response = requests.post(f"{self.api_url}/embed_documents", json=payload,
-                                 headers=headers)
-        if response.status_code == 200:
-            result = response.json()
-            return result.get('embedding_list', '')
-        else:
-            raise Exception(f"Embedder API request failed with status code {response.status_code}")
+        if self._session is None:
+            async with self._session_lock:
+                if self._session is None and not self._closed:
+                    self._session = aiohttp.ClientSession()
+        return self._session
 
-    def embed_query(self, query: str = None, image: str = None):
-        payload = {}
-        if query is not None:
-            payload["query"] = query
-        if image is not None:
-            payload["image"] = image
-
-        headers = {'Content-Type': 'application/json'}
-        response = requests.post(f"{self.api_url}/embed_query", json=payload,
-                                 headers=headers)
-        if response.status_code == 200:
-            result = response.json()
-            return result.get('embedding', '')
-        else:
-            raise Exception(f"Embedder API request failed with status code {response.status_code}")
-
-    def v1_embeddings(self, model: str, input: List[str]):
+    async def v1_embeddings(self, model: str, input: List[str]):
         if not model or not input:
             raise ValueError("Both model and input parameters are required")
 
-        payload = {
-            "model": model,
-            "input": input
+        if not isinstance(input, list):
+            raise ValueError("Input must be a list of strings")
+
+        results = []
+
+        for i in range(0, len(input), self.batch_size):
+            batch = input[i:i + self.batch_size]
+
+            payload = {
+                "model": model,
+                "input": batch
+            }
+
+            headers = {'Content-Type': 'application/json'}
+            session = await self.get_session()
+
+            for attempt in range(3):
+                try:
+                    async with session.post(
+                            f"{self.api_url}/v1/embeddings",
+                            json=payload,
+                            headers=headers,
+                            timeout=aiohttp.ClientTimeout(total=30)
+                    ) as response:
+                        if response.status == 200:
+                            batch_result = await response.json()
+                            results.extend(batch_result['data'])
+                            break
+                        else:
+                            error_text = await response.text()
+                            logger.error(f"Attempt {attempt + 1} failed with status {response.status}: {error_text}")
+                            if response.status not in {500, 502, 503, 504}:
+                                break
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    logger.error(f"Attempt {attempt + 1} failed with error: {str(e)}")
+                    if attempt == 2:
+                        raise Exception(f"Request failed after 3 attempts: {str(e)}")
+
+                await asyncio.sleep(2 ** attempt)
+
+        return {
+            'object': "list",
+            'data': results,
+            'model': model,
+            'usage': {
+                'prompt_tokens': sum(len(text.split()) for text in input),
+                'total_tokens': sum(len(text.split()) for text in input)
+            }
         }
 
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[500, 502, 503, 504]
-        )
+    async def close(self):
+        """Close session"""
+        async with self._session_lock:
+            if not self._closed and self._session is not None:
+                try:
+                    await self._session.close()
+                except Exception as e:
+                    logger.error(f"Error closing session: {e}")
+                finally:
+                    self._session = None
+                    self._closed = True
 
-        session = requests.Session()
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
+    async def __aenter__(self):
+        return self
 
-        headers = {'Content-Type': 'application/json'}
-        try:
-            response = session.post(
-                f"{self.api_url}/v1/embeddings",
-                json=payload,
-                headers=headers,
-                timeout=30
-            )
-
-            if response.status_code == 200:
-                return response.json()
-            else:
-                raise Exception(f"Embedder API request failed with status code {response.status_code}")
-
-        except requests.exceptions.Timeout:
-            raise Exception("Request timed out")
-        except requests.exceptions.RequestException as e:
-            raise Exception(f"Request failed: {str(e)}")
-        finally:
-            session.close()
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         '--url',
-        default='http://127.0.0.1:5003',
-    )
-    parser.add_argument(
-        '--query',
-        default='你好，请介绍下自己',
+        default='http://localhost:5003',
     )
     parser.add_argument(
         '--texts',
@@ -121,48 +123,25 @@ def parse_args():
     return args
 
 
-def main():
+async def async_main():
     args = parse_args()
-    embedder = EmbedderClient(args.url)
-    status = embedder.check_health()
-
-    if not status:
-        logger.error("Health check failed. The embedding server at"
-                     " '{}' is not responding as expected.".format(args.url))
-    else:
-        logger.info("Health check succeeded. The embedding server at"
-                    " '{}' is responding as expected.".format(args.url))
-        try:
-            # res = embedder.embed_query(query=args.query)
-            # if res:
-            #     embedding_np = np.array(res)
-            #     logger.info(f"query: '{args.query}'")
-            #     logger.info(f"Shape: {embedding_np.shape}")
-            # else:
-            #     logger.warning(f"Received empty embedding for query: '{args.query}'")
-
-            # res2 = embedder.embed_documents(texts=args.texts)
-            # if res2:
-            #     embedding_np2 = np.array(res2)
-            #     logger.info(f"texts: {args.texts}")
-            #     logger.info(f"Shape: {embedding_np2.shape}")
-            # else:
-            #     logger.warning("No embeddings were generated.")
-
-            res3 = embedder.v1_embeddings(model='test', input=args.texts)
-            if res3:
-                data = res3.get("data", [])
-                if data:
-                    for i, embedding_item in enumerate(data):
-                        embedding = embedding_item.get("embedding", [])
-                        logger.info(f"Text {i + 1}: '{args.texts[i]}'")
-                        embedding_array = np.array(embedding)
-                        logger.info(f"Embedding shape: {embedding_array.shape}")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error while making request to embedder service: {e}")
-        except Exception as e:
-            logger.error(f"Unexpected error occurred: {e}")
+    async_embedder = AsyncEmbedderClient(args.url)
+    try:
+        logger.info("Testing AsyncEmbedderClient:")
+        res_async = await async_embedder.v1_embeddings(model='test', input=args.texts)
+        if res_async:
+            data = res_async.get("data", [])
+            if data:
+                for i, embedding_item in enumerate(data):
+                    embedding = embedding_item.get("embedding", [])
+                    logger.info(f"Async Text {i + 1}: '{args.texts[i]}'")
+                    embedding_array = np.array(embedding)
+                    logger.info(f"Async Embedding shape: {embedding_array.shape}")
+    except Exception as e:
+        logger.error(f"Unexpected error occurred: {e}")
+    finally:
+        await async_embedder.close()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(async_main())
