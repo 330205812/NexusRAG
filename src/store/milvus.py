@@ -625,46 +625,6 @@ class Milvus():
         )
         return [doc for doc, _ in res]
 
-    def similarity_search_with_score(
-            self,
-            query: str,
-            k: int = 4,
-            param: Optional[dict] = None,
-            expr: Optional[str] = None,
-            timeout: Optional[float] = None,
-            **kwargs: Any,
-    ) -> List[Tuple[Document, float]]:
-        """Perform a search on a query string and return results with score.
-
-        For more information about the search parameters, take a look at the pymilvus
-        documentation found here:
-        https://milvus.io/api-reference/pymilvus/v2.2.6/Collection/search().md
-
-        Args:
-            query (str): The text being searched.
-            k (int, optional): The amount of results to return. Defaults to 4.
-            param (dict): The search params for the specified index.
-                Defaults to None.
-            expr (str, optional): Filtering expression. Defaults to None.
-            timeout (float, optional): How long to wait before timeout error.
-                Defaults to None.
-            kwargs: Collection.search() keyword arguments.
-
-        Returns:
-            List[float], List[Tuple[Document, any, any]]:
-        """
-        if self.col is None:
-            logger.debug("No existing collection to search.")
-            return []
-
-        # Embed the query text.
-        embedding = self.embedding_func.embed_query(query)
-        timeout = self.timeout or timeout
-        res = self.similarity_search_with_score_by_vector(
-            embedding=embedding, k=k, param=param, expr=expr, timeout=timeout, **kwargs
-        )
-        return res
-
     def similarity_search_with_score_by_vector(
             self,
             embedding: List[float],
@@ -733,56 +693,6 @@ class Milvus():
         except Exception as e:
             logger.error(f"Error in similarity_search_with_score_by_vector: {str(e)}", exc_info=True)
             raise
-
-    def max_marginal_relevance_search(
-            self,
-            query: str,
-            k: int = 4,
-            fetch_k: int = 20,
-            lambda_mult: float = 0.5,
-            param: Optional[dict] = None,
-            expr: Optional[str] = None,
-            timeout: Optional[float] = None,
-            **kwargs: Any,
-    ) -> List[Document]:
-        """Perform a search and return results that are reordered by MMR.
-
-        Args:
-            query (str): The text being searched.
-            k (int, optional): How many results to give. Defaults to 4.
-            fetch_k (int, optional): Total results to select k from.
-                Defaults to 20.
-            lambda_mult: Number between 0 and 1 that determines the degree
-                        of diversity among the results with 0 corresponding
-                        to maximum diversity and 1 to minimum diversity.
-                        Defaults to 0.5
-            param (dict, optional): The search params for the specified index.
-                Defaults to None.
-            expr (str, optional): Filtering expression. Defaults to None.
-            timeout (float, optional): How long to wait before timeout error.
-                Defaults to None.
-            kwargs: Collection.search() keyword arguments.
-
-
-        Returns:
-            List[Document]: Document results for search.
-        """
-        if self.col is None:
-            logger.debug("No existing collection to search.")
-            return []
-
-        embedding = self.embedding_func.embed_query(query)
-        timeout = self.timeout or timeout
-        return self.max_marginal_relevance_search_by_vector(
-            embedding=embedding,
-            k=k,
-            fetch_k=fetch_k,
-            lambda_mult=lambda_mult,
-            param=param,
-            expr=expr,
-            timeout=timeout,
-            **kwargs,
-        )
 
     def max_marginal_relevance_search_by_vector(
             self,
