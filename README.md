@@ -96,9 +96,9 @@ embedding_bind_port = 5003
 reranker_model_path = /path/to/your/bce-reranker-base_v1
 reranker_bind_port = 5001
 
-es_url = http://localhost:9200
+es_url = http://127.0.0.1:9200
 index_name = test
-milvus_url = localhost:19530
+milvus_url = 127.0.0.1:19530
 ```
 ### 3. Launch Service
 ```
